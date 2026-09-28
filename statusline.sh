@@ -127,6 +127,8 @@ CACHE_FILE="${STATUSLINE_CACHE_FILE:-${CONFIG_DIR}/usage-cache.json}"
 CACHE_TTL="${STATUSLINE_CACHE_TTL:-300}"  # seconds
 
 model=$(echo "$input" | jq -r '.model.display_name // "unknown"')
+# Absent for models without effort support; resolved to the default when unset.
+effort=$(echo "$input" | jq -r '.effort.level // empty')
 ctx_used_pct=$(echo "$input" | jq -r '.context_window.used_percentage // empty')
 ctx_tok_used=$(echo "$input" | jq -r '((.context_window.total_input_tokens // 0) + (.context_window.total_output_tokens // 0))')
 ctx_tok_total=$(echo "$input" | jq -r '.context_window.context_window_size // 0')
@@ -383,6 +385,196 @@ else
   model_str=$(abbrev_model "$model")
 fi
 model_out=$(printf "\033[38;5;80m%s\033[0m" "$model_str")
+
+# --- Ultracode ---
+# Ultracode (xhigh plus workflow orchestration) is not in the status line JSON,
+# so it is reconstructed from the transcript. Changes show up there as /effort
+# and /model output at once, and on the next prompt as an ultra_effort_enter or
+# ultra_effort_exit attachment that the harness derives from the real state.
+# The latest record wins. The patterns match unescaped JSON structure, so copies
+# of these strings quoted in tool output or messages cannot match.
+_uc_out='"role":"user","content":"<local-command-stdout>'
+_uc_cmd="Set effort level to [a-z]+|Set model to [^\"]* with \`[a-z]+\` effort|Effort level set to auto|Effort set to auto for this session|Effort '[a-z]+' exceeds the cap|Not applied: CLAUDE_CODE_EFFORT_LEVEL|CLAUDE_CODE_EFFORT_LEVEL=[^ ]* overrides this session[^\"]* takes over"
+UC_RE="${_uc_out}(${_uc_cmd})"'|"attachment":\{"type":"ultra_effort_(enter|exit)"'
+UC_STATE_DIR="${STATUSLINE_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/claude-statusline}"
+
+uc_state_of() {
+  [[ "$1" =~ $UC_RE ]] || return
+  case "${BASH_REMATCH[0]}" in
+    *'ultra_effort_enter"'|*" to ultracode"|*'`ultracode` effort'|*"ultracode takes over") echo on ;;
+    *) echo off ;;
+  esac
+}
+
+uc_ts_ms() {
+  [[ "$1" =~ \"timestamp\":\"([^\"]+)\" ]] && date -d "${BASH_REMATCH[1]}" +%s%3N 2>/dev/null
+}
+
+# The Claude Code process running this script. Ultracode is session-only and is
+# never restored on resume, so only records written since this process started
+# count. A state file per process carries the state across /clear and in-app
+# /resume, which switch to another transcript file.
+claude_pid="" claude_ticks=""
+_p=$PPID
+for _ in 1 2 3 4 5; do
+  { read -r _stat < "/proc/$_p/stat"; } 2>/dev/null || break
+  read -r -a _f <<< "${_stat##*) }"
+  if [[ "${_stat#*(}" == "claude) "* ]]; then claude_pid=$_p; claude_ticks=${_f[19]}; break; fi
+  _p=${_f[1]}
+  [[ "$_p" =~ ^[0-9]+$ ]] && (( _p > 1 )) || break
+done
+
+proc_start_ms() {
+  local k v hz
+  while read -r k v _; do [[ "$k" == btime ]] && break; done < /proc/stat
+  hz=$(getconf CLK_TCK 2>/dev/null)
+  echo $(( v * 1000 + claude_ticks * 1000 / ${hz:-100} ))
+}
+
+# State before this process has written any record: --effort ultracode, or the
+# session-scoped `ultracode` settings key (--settings JSON or file, settings files).
+uc_seed() {
+  local a prev="" cwd proj files=() f
+  cwd=$(readlink "/proc/$claude_pid/cwd" 2>/dev/null)
+  while IFS= read -r -d '' a; do
+    if [[ "$prev" == --effort && "$a" == ultracode || "$a" == --effort=ultracode ]]; then echo on; return; fi
+    [[ "$a" == --settings=* ]] && { prev=--settings; a=${a#--settings=}; }
+    if [[ "$prev" == --settings ]]; then
+      if [[ "$a" == "{"* ]]; then
+        jq -e '.ultracode == true' <<< "$a" &>/dev/null && { echo on; return; }
+      else
+        [[ "$a" == /* ]] || a="$cwd/$a"
+        files+=("$a")
+      fi
+    fi
+    prev=$a
+  done < "/proc/$claude_pid/cmdline"
+  proj=$(jq -r '.workspace.project_dir // empty' <<< "$input")
+  files+=("$CONFIG_DIR/settings.json" "$proj/.claude/settings.json" "$proj/.claude/settings.local.json")
+  for f in "${files[@]}"; do
+    [[ -r "$f" ]] && jq -e '.ultracode == true' "$f" &>/dev/null && { echo on; return; }
+  done
+  echo off
+}
+
+# Remove the state files of Claude processes that have exited.
+uc_prune() {
+  local f base pid _stat _f
+  for f in "$UC_STATE_DIR"/*-*; do
+    [[ -f "$f" ]] || continue
+    base=${f##*/}; pid=${base%%-*}
+    if { read -r _stat < "/proc/$pid/stat"; } 2>/dev/null; then
+      read -r -a _f <<< "${_stat##*) }"
+      [[ "$pid-${_f[19]}" == "$base" ]] && continue
+    fi
+    rm -f "$f"
+  done
+}
+
+ultracode_on() {
+  local line state="" since="" offset=0 path="" size from ts state_file
+  if [[ -z "$claude_pid" ]]; then
+    # No /proc, or not run by Claude Code: the latest record of the whole file.
+    [[ -n "$transcript" && -f "$transcript" ]] || return 1
+    line=$(LC_ALL=C grep -E "$UC_RE" "$transcript" 2>/dev/null | tail -1)
+    [[ "$(uc_state_of "$line")" == on ]]
+    return
+  fi
+  state_file="$UC_STATE_DIR/$claude_pid-$claude_ticks"
+  [[ -r "$state_file" ]] && IFS=$'\t' read -r since state offset path < "$state_file"
+  if [[ -z "$since" ]]; then
+    since=$(proc_start_ms)
+    state=$(uc_seed)
+    uc_prune
+  fi
+  # Another file after /clear or /resume: scan it from the start. Its records
+  # older than the last applied one (a resumed or branched history) do not count.
+  [[ "$path" == "$transcript" ]] || offset=0
+  if [[ -n "$transcript" && -f "$transcript" ]]; then
+    size=$(stat -c %s "$transcript" 2>/dev/null) || size=0
+    (( size < offset )) && offset=0
+    # Rescan a little before the old offset: a record half written during the
+    # previous scan is complete now, and applying a record twice is harmless.
+    from=$(( offset > 4096 ? offset - 4096 : 0 ))
+    if (( from == 0 )); then
+      line=$(LC_ALL=C grep -E "$UC_RE" "$transcript" 2>/dev/null | tail -1)
+    else
+      line=$(tail -c +$(( from + 1 )) "$transcript" 2>/dev/null | LC_ALL=C grep -E "$UC_RE" | tail -1)
+    fi
+    if [[ -n "$line" ]]; then
+      ts=$(uc_ts_ms "$line")
+      if [[ -n "$ts" ]] && (( ts >= since )); then
+        state=$(uc_state_of "$line")
+        since=$ts
+      fi
+    fi
+    offset=$size
+  fi
+  mkdir -p "$UC_STATE_DIR" 2>/dev/null &&
+    printf '%s\t%s\t%s\t%s\n' "$since" "$state" "$offset" "$transcript" > "$state_file.$$" 2>/dev/null &&
+    mv -f "$state_file.$$" "$state_file" 2>/dev/null
+  [[ "$state" == on ]]
+}
+
+# Ultracode also needs dynamic workflows. Turning them off in /config leaves the
+# ultracode flag set but inactive, and writes no record the patterns match.
+workflows_enabled() {
+  case "${CLAUDE_CODE_DISABLE_WORKFLOWS:-0}" in 0|false) ;; *) return 1 ;; esac
+  local proj files=() f v
+  proj=$(jq -r '.workspace.project_dir // empty' <<< "$input")
+  # Ascending precedence. disableWorkflows is ignored in user settings, as
+  # Claude Code itself does.
+  for f in "$CONFIG_DIR/settings.json" "$proj/.claude/settings.json" \
+           "$proj/.claude/settings.local.json" /etc/claude-code/managed-settings.json; do
+    [[ -r "$f" ]] && files+=("$f")
+  done
+  (( ${#files[@]} )) || return 0
+  v=$(jq -rn --arg user "$CONFIG_DIR/settings.json" '
+    [inputs | {f: input_filename, e: .enableWorkflows, d: .disableWorkflows}]
+    | if any(.[]; .f != $user and .d == true) then "false"
+      else ([.[] | .e | select(. != null)] | last | tostring) end' "${files[@]}" 2>/dev/null)
+  [[ "$v" != false ]]
+}
+
+if [[ "$effort" == "xhigh" ]] && ultracode_on && workflows_enabled; then
+  effort="ultracode"
+fi
+
+# Effort colors are the ones the /effort picker uses in the dark theme (warning,
+# success, permission, autoAccept, rainbow). The picker animates xhigh and max;
+# a static line keeps xhigh's base purple and spreads the rainbow over the letters.
+# Ultracode, drawn there as a full-screen purple pulse, gets its purple as a fill.
+EFFORT_RAINBOW=("235;95;87" "245;139;87" "250;195;95" "145;200;130" "130;170;220" "155;130;200" "200;130;180")
+format_effort() {
+  local level=$1 text=$1 rgb
+  if (( COLS < 90 )); then
+    case "$level" in
+      low) text="lo" ;; medium) text="med" ;; high) text="hi" ;; xhigh) text="xhi" ;; ultracode) text="ultra" ;;
+    esac
+  fi
+  case "$level" in
+    ultracode)
+      printf '\033[1;38;2;30;10;60;48;2;175;135;255m%s\033[0m' "$text"
+      return
+      ;;
+    low)    rgb="255;193;7" ;;
+    medium) rgb="78;186;101" ;;
+    high)   rgb="177;185;249" ;;
+    xhigh)  rgb="175;135;255" ;;
+    max)
+      local n=${#text} i k out=""
+      for (( i=0; i<n; i++ )); do
+        k=$(( n > 1 ? i * 6 / (n - 1) : 0 ))
+        out+=$(printf '\033[38;2;%sm%s' "${EFFORT_RAINBOW[k]}" "${text:i:1}")
+      done
+      printf '%s\033[0m' "$out"
+      return
+      ;;
+    *)      rgb="153;153;153" ;;
+  esac
+  printf '\033[38;2;%sm%s\033[0m' "$rgb" "$text"
+}
+[[ -n "$effort" ]] && model_out+=" $(format_effort "$effort")"
 
 printf "%s %s%s%s%s%s%s%s%s%s" \
   "$TAG" "$model_out" "$SEP" "$ctx_out" "$SEP" "$sess_out" "$sess_reset_out" "$SEP" "$week_out" "$week_reset_out"
