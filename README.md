@@ -4,17 +4,15 @@ A status line for [Claude Code](https://claude.com/claude-code) showing the acco
 in use, the model and its effort level, context fill, and both usage quotas with their reset countdowns.
 Layout collapses in three steps as the terminal narrows.
 
-```
-【you@example.com·Acme Inc】 Opus 5 high  ctx ████▏      42% (57k/200k) ⴵ2  sess █▍         14% ↻2h24m  week ▍          4% ↻6d4h
-【you@example.com·Acme Inc】 O5 hi  c ██    42% ⴵ2  s ▋     14% ↻2h24m  w ▏     4% ↻6d4h
-【you@example.com·Acme Inc】 O5 hi c:42%ⴵ2 s:14% ↻2h24m w:4% ↻6d4h
-```
+![The status line at 120, 80 and 60 columns](docs/layouts.png)
 
 Percentages are colored green below 50%, yellow from 50%, red from 80%. Bars use
 partial-block glyphs for eighth-of-a-cell resolution, so a 10-cell bar has 80
 distinct levels.
 
 The effort level (`low`, `medium`, `high`, `xhigh`, `max`) takes the colors the `/effort` picker gives it in the dark theme: yellow, green, pale blue, purple, and a rainbow for `max`. The picker animates the top two; the status line cannot, so `xhigh` gets the plain purple and `max` a per-letter rainbow. Models without effort support (Haiku) show no effort segment. Ultracode (xhigh plus workflow orchestration, team and enterprise plans) is shown as a filled purple `ultracode` badge, `ultra` below 90 columns; see the notes below for how it is detected.
+
+![Effort levels low, medium, high, xhigh, max and the ultracode badge](docs/effort.png)
 
 `ⴵ2` after the context meter counts how many times the conversation has been compacted. It is the number of `compact_boundary` records in the transcript, so it survives `--resume` and starts over after `/clear`, and it is hidden until the first compaction. A small cache per transcript keeps the count and the byte offset it covers, so each render reads only what was appended since.
 
@@ -125,6 +123,8 @@ which account is spending. Pin the colors if you want them stable:
 A `[1m]` long-context marker in the model name becomes a trailing `+` (`S5+`).
 
 ## Notes
+
+The screenshots are drawn from the script's real output on synthetic data (no account, no API call) by `docs/make-screenshots.py`, in unscii without anti-aliasing. It needs Python with Pillow and fontTools.
 
 The bracket color tracks the `/color` session setting. That setting is not
 exposed to status line scripts, so it is recovered by grepping the transcript for
