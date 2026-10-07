@@ -5,9 +5,9 @@ in use, the model and its effort level, context fill, and both usage quotas with
 Layout collapses in three steps as the terminal narrows.
 
 ```
-【you@example.com·Acme Inc】 Opus 5 high  ctx ████▏      42% (57k/200k)  sess █▍         14% ↻2h24m  week ▍          4% ↻6d4h
-【you@example.com·Acme Inc】 O5 hi  c ██    42%  s ▋     14% ↻2h24m  w ▏     4% ↻6d4h
-【you@example.com·Acme Inc】 O5 hi c:42% s:14% ↻2h24m w:4% ↻6d4h
+【you@example.com·Acme Inc】 Opus 5 high  ctx ████▏      42% (57k/200k) ⴵ2  sess █▍         14% ↻2h24m  week ▍          4% ↻6d4h
+【you@example.com·Acme Inc】 O5 hi  c ██    42% ⴵ2  s ▋     14% ↻2h24m  w ▏     4% ↻6d4h
+【you@example.com·Acme Inc】 O5 hi c:42%ⴵ2 s:14% ↻2h24m w:4% ↻6d4h
 ```
 
 Percentages are colored green below 50%, yellow from 50%, red from 80%. Bars use
@@ -15,6 +15,8 @@ partial-block glyphs for eighth-of-a-cell resolution, so a 10-cell bar has 80
 distinct levels.
 
 The effort level (`low`, `medium`, `high`, `xhigh`, `max`) takes the colors the `/effort` picker gives it in the dark theme: yellow, green, pale blue, purple, and a rainbow for `max`. The picker animates the top two; the status line cannot, so `xhigh` gets the plain purple and `max` a per-letter rainbow. Models without effort support (Haiku) show no effort segment. Ultracode (xhigh plus workflow orchestration, team and enterprise plans) is shown as a filled purple `ultracode` badge, `ultra` below 90 columns; see the notes below for how it is detected.
+
+`ⴵ2` after the context meter counts how many times the conversation has been compacted. It is the number of `compact_boundary` records in the transcript, so it survives `--resume` and starts over after `/clear`, and it is hidden until the first compaction. A small cache per transcript keeps the count and the byte offset it covers, so each render reads only what was appended since.
 
 ## Install
 
@@ -89,7 +91,7 @@ All optional; the defaults need no setup.
 | `STATUSLINE_CACHE_FILE` | Where to keep the usage cache. |
 | `STATUSLINE_CACHE_TTL` | Cache lifetime in seconds. Default 300. |
 | `STATUSLINE_COLS` | Forces a terminal width. Useful for testing the collapsed layouts. |
-| `STATUSLINE_STATE_DIR` | Where the per-process ultracode state files go. Default: `$XDG_RUNTIME_DIR/claude-statusline`, or `/tmp/claude-statusline`. |
+| `STATUSLINE_STATE_DIR` | Where the per-process ultracode state files and the per-transcript compaction counts go. Default: `$XDG_RUNTIME_DIR/claude-statusline`, or `/tmp/claude-statusline`. |
 
 Colors accept an xterm-256 index (`152`), a hex triplet (`#98c0c0`), or a raw SGR
 parameter string (`38;5;152`).

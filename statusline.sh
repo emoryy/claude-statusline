@@ -125,6 +125,7 @@ fi
 CREDS_FILE="${CONFIG_DIR}/.credentials.json"
 CACHE_FILE="${STATUSLINE_CACHE_FILE:-${CONFIG_DIR}/usage-cache.json}"
 CACHE_TTL="${STATUSLINE_CACHE_TTL:-300}"  # seconds
+STATE_DIR="${STATUSLINE_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/claude-statusline}"
 
 model=$(echo "$input" | jq -r '.model.display_name // "unknown"')
 # Absent for models without effort support; resolved to the default when unset.
@@ -279,6 +280,45 @@ if (( COLS >= 100 )) && (( ctx_tok_total > 0 )); then
   ctx_out+=$(printf " \033[38;5;248m(%s/%s)\033[0m" "$(fmt_tokens "$ctx_tok_used")" "$(fmt_tokens "$ctx_tok_total")")
 fi
 
+# --- Compactions ---
+# Each compaction appends a compact_boundary record to the transcript; /clear
+# starts a new file, so the count is per session and survives --resume. A cache
+# per transcript holds the count and the byte offset it covers, so a render
+# only reads what was appended since. It advances only over complete lines, or
+# a record cut mid-pattern could be missed.
+count_compactions() {
+  [[ -n "$transcript" && -f "$transcript" ]] || return
+  local cache="$STATE_DIR/compact-$(basename "$transcript" .jsonl)" offset=0 count=0 size n last
+  [[ -r "$cache" ]] && read -r offset count < "$cache"
+  size=$(stat -c %s "$transcript" 2>/dev/null) || return
+  (( size < offset )) && offset=0 count=0
+  if (( size > offset )); then
+    # Read exactly the bytes measured above: the file can grow meanwhile, and
+    # counting past the offset that gets saved would count a record twice.
+    n=$(tail -c +$(( offset + 1 )) "$transcript" | head -c $(( size - offset )) |
+      LC_ALL=C grep -cF '"subtype":"compact_boundary"')
+    last=$(tail -c +"$size" "$transcript" | head -c 1 | od -An -tx1)
+    if [[ "$last" == *0a ]]; then
+      count=$(( count + n ))
+      mkdir -p "$STATE_DIR" 2>/dev/null &&
+        printf '%s %s\n' "$size" "$count" > "$cache.$$" 2>/dev/null && mv -f "$cache.$$" "$cache" 2>/dev/null
+    else
+      echo $(( count + n ))
+      return
+    fi
+  fi
+  echo "$count"
+}
+compactions=$(count_compactions)
+if (( ${compactions:-0} > 0 )); then
+  # Purples of Claude Code's dark theme, which draws its own token and
+  # compaction readouts in purple: the icon in skill/autoAccept, the count in
+  # the paler rainbow_indigo_shimmer so the two stay apart.
+  _sp=" "
+  (( COLS < 70 )) && _sp=""
+  ctx_out+=$(printf "%s\033[38;2;175;135;255mⴵ\033[38;2;195;180;230m%d\033[0m" "$_sp" "$compactions")
+fi
+
 # --- Fetch usage from API (with caching) ---
 # The usage figures come from the same OAuth endpoint the /usage command uses.
 # It is undocumented, so every failure path has to degrade quietly.
@@ -396,7 +436,7 @@ model_out=$(printf "\033[38;5;80m%s\033[0m" "$model_str")
 _uc_out='"role":"user","content":"<local-command-stdout>'
 _uc_cmd="Set effort level to [a-z]+|Set model to [^\"]* with \`[a-z]+\` effort|Effort level set to auto|Effort set to auto for this session|Effort '[a-z]+' exceeds the cap|Not applied: CLAUDE_CODE_EFFORT_LEVEL|CLAUDE_CODE_EFFORT_LEVEL=[^ ]* overrides this session[^\"]* takes over"
 UC_RE="${_uc_out}(${_uc_cmd})"'|"attachment":\{"type":"ultra_effort_(enter|exit)"'
-UC_STATE_DIR="${STATUSLINE_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/claude-statusline}"
+UC_STATE_DIR="$STATE_DIR"
 
 uc_state_of() {
   [[ "$1" =~ $UC_RE ]] || return
@@ -463,6 +503,7 @@ uc_prune() {
   for f in "$UC_STATE_DIR"/*-*; do
     [[ -f "$f" ]] || continue
     base=${f##*/}; pid=${base%%-*}
+    [[ "$base" =~ ^[0-9]+-[0-9]+(\.[0-9]+)?$ ]] || continue
     if { read -r _stat < "/proc/$pid/stat"; } 2>/dev/null; then
       read -r -a _f <<< "${_stat##*) }"
       [[ "$pid-${_f[19]}" == "$base" ]] && continue
