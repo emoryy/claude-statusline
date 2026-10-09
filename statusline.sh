@@ -134,25 +134,36 @@ ctx_used_pct=$(echo "$input" | jq -r '.context_window.used_percentage // empty')
 ctx_tok_used=$(echo "$input" | jq -r '((.context_window.total_input_tokens // 0) + (.context_window.total_output_tokens // 0))')
 ctx_tok_total=$(echo "$input" | jq -r '.context_window.context_window_size // 0')
 
-# Abbreviate a model display name to its initial + version, so it still fits
-# once the layout collapses: "Opus 5" -> O5, "Haiku 4.5" -> H4.5.
-# A [1m] long-context marker becomes a trailing "+".
-abbrev_model() {
-  local name=$1 onem=""
-  [[ "$name" == *"[1m]"* ]] && onem="+"
-  name=${name//\[1m\]/}
+# The model name and its version in two related teals, so the version reads as
+# its own field. Below the full layout the name collapses to its initial:
+# "Opus 5" -> O5, "Haiku 4.5" -> H4.5. A [1m] long-context marker becomes a
+# trailing "+" there.
+MODEL_C="38;5;80"
+MODEL_VER_C="38;5;116"
+format_model() {
+  local name=$1 short=$2 onem=""
+  if $short; then
+    [[ "$name" == *"[1m]"* ]] && onem="+"
+    name=${name//\[1m\]/}
+  fi
   local parts
   read -r -a parts <<< "$name"
-  (( ${#parts[@]} )) || { printf '?'; return; }
-  local rest="" i
-  for (( i=1; i<${#parts[@]}; i++ )); do rest+="${parts[i]}"; done
-  if [[ -z "$rest" ]]; then
-    # Single-word name (no version to anchor on): keep enough to stay readable.
-    printf '%s%s' "${parts[0]:0:3}" "$onem"
+  (( ${#parts[@]} )) || { printf '\033[%sm?\033[0m' "$MODEL_C"; return; }
+  local head=${parts[0]} rest="${parts[*]:1}"
+  if $short; then
+    rest=${rest// /}
+    if [[ -z "$rest" ]]; then
+      # Single-word name (no version to anchor on): keep enough to stay readable.
+      head=${head:0:3}
+    else
+      head=${head:0:1}
+      head=${head^^}
+    fi
+    rest+=$onem
   else
-    local initial=${parts[0]:0:1}
-    printf '%s%s%s' "${initial^^}" "$rest" "$onem"
+    [[ -n "$rest" ]] && rest=" $rest"
   fi
+  printf '\033[%sm%s\033[%sm%s\033[0m' "$MODEL_C" "$head" "$MODEL_VER_C" "$rest"
 }
 
 # Format a token count compactly: 57242 -> "57k", 1000000 -> "1M", 1500000 -> "1.5M"
@@ -169,11 +180,14 @@ fmt_tokens() {
   }'
 }
 
-# --- Progress bar function ---
+# --- Progress bar ---
 # Uses Unicode partial-block characters (U+258F..U+2588) for 8x sub-cell
 # resolution. With width=10 that's 80 distinct levels (~1.25% per step).
-make_bar() {
-  local pct=$1 width=${2:-10}
+# The percentage goes inside the bar when it fits with at least one cell
+# between it and the fill edge: right-aligned in the empty part, else
+# left-aligned in the filled part, else after the bar.
+format_bar() {
+  local pct=$1 width=$2 c=$3 bg=$4
   local eighths=$(( pct * width * 8 / 100 ))
   local max=$(( width * 8 ))
   (( eighths > max )) && eighths=$max
@@ -194,11 +208,22 @@ make_bar() {
     7) partial="▉" ;;
   esac
 
-  local bar=""
-  for (( i=0; i<full; i++ )); do bar+="█"; done
-  bar+="$partial"
-  for (( i=0; i<empty; i++ )); do bar+=" "; done
-  echo "$bar"
+  local txt="${pct}%" i fill="" pad=""
+  local n=${#txt}
+  if (( empty > n )); then
+    for (( i=0; i<full; i++ )); do fill+="█"; done
+    for (( i=0; i<empty-n; i++ )); do pad+=" "; done
+    printf "\033[${c};${bg}m%s%s%s%s\033[0m" "$fill" "$partial" "$pad" "$txt"
+  elif (( full > n )); then
+    for (( i=0; i<full-n; i++ )); do fill+="█"; done
+    for (( i=0; i<empty; i++ )); do pad+=" "; done
+    # Dark text on the fill color; the remaining full cells share that color.
+    printf "\033[${BAR_INK};48;${c#38;}m%s\033[0;${c};${bg}m%s%s%s\033[0m" "$txt" "$fill" "$partial" "$pad"
+  else
+    for (( i=0; i<full; i++ )); do fill+="█"; done
+    for (( i=0; i<empty; i++ )); do pad+=" "; done
+    printf "\033[${c};${bg}m%s%s%s\033[0m \033[${c}m%s\033[0m" "$fill" "$partial" "$pad" "$txt"
+  fi
 }
 
 # --- Color by percentage: green < 50, yellow 50-79, red >= 80 ---
@@ -215,13 +240,17 @@ color_for_pct() {
 # --- Bar background color (dim shade matching the fg color) ---
 # Used so the unfilled cells render as a continuous tinted strip instead of
 # the disjoint ░ pattern, which clashes visually with partial-block glyphs.
+# Each is about a fifth of the fill color over a dark gray, so the strip stays
+# a muted tint instead of a saturated block.
 bar_bg_for_pct() {
   local pct=${1:-0}
-  if (( pct >= 80 )); then echo "48;5;52"      # dark red
-  elif (( pct >= 50 )); then echo "48;5;58"    # olive / dark yellow
-  else echo "48;5;22"                          # dark green
+  if (( pct >= 80 )); then echo "48;2;74;50;52"    # red
+  elif (( pct >= 50 )); then echo "48;2;72;66;34"  # yellow
+  else echo "48;2;45;66;53"                        # green
   fi
 }
+# Percentage text drawn over the filled part.
+BAR_INK="38;2;28;28;30"
 
 # --- Terminal width (STATUSLINE_COLS/COLS can override for testing) ---
 # Claude Code statusline runs without a controlling TTY on stdin, so $COLUMNS
@@ -245,12 +274,10 @@ format_metric() {
   pct_int=${pct_int:-0}
   local c=$(color_for_pct "$pct_int")
   local bg=$(bar_bg_for_pct "$pct_int")
-  if (( COLS >= 90 )); then
-    local bar=$(make_bar "$pct_int" 10)
-    printf "\033[${c}m%s\033[0m \033[${c};${bg}m%s\033[0m \033[${c}m%d%%\033[0m" "$label" "$bar" "$pct_int"
-  elif (( COLS >= 70 )); then
-    local bar=$(make_bar "$pct_int" 5)
-    printf "\033[${c}m%s\033[0m \033[${c};${bg}m%s\033[0m \033[${c}m%d%%\033[0m" "$short" "$bar" "$pct_int"
+  if (( TIER <= 1 )); then
+    printf "\033[${c}m%s\033[0m %s" "$label" "$(format_bar "$pct_int" 10 "$c" "$bg")"
+  elif (( TIER == 2 )); then
+    printf "\033[${c}m%s\033[0m %s" "$short" "$(format_bar "$pct_int" 5 "$c" "$bg")"
   else
     printf "\033[${c}m%s:%d%%\033[0m" "$short" "$pct_int"
   fi
@@ -261,9 +288,9 @@ format_metric() {
 format_metric_na() {
   local label=$1 short=$2
   local dim="38;5;240"
-  if (( COLS >= 90 )); then
+  if (( TIER <= 1 )); then
     printf "\033[${dim}m%s n/a\033[0m" "$label"
-  elif (( COLS >= 70 )); then
+  elif (( TIER == 2 )); then
     printf "\033[${dim}m%s n/a\033[0m" "$short"
   else
     printf "\033[${dim}m%s:n/a\033[0m" "$short"
@@ -273,12 +300,6 @@ format_metric_na() {
 # --- Context % ---
 ctx_pct_int=${ctx_used_pct%.*}
 ctx_pct_int=${ctx_pct_int:-0}
-ctx_out=$(format_metric "ctx" "c" "$ctx_pct_int")
-
-# Append token counts when there's room (avoids wrapping at narrow widths)
-if (( COLS >= 100 )) && (( ctx_tok_total > 0 )); then
-  ctx_out+=$(printf " \033[38;5;248m(%s/%s)\033[0m" "$(fmt_tokens "$ctx_tok_used")" "$(fmt_tokens "$ctx_tok_total")")
-fi
 
 # --- Compactions ---
 # Each compaction appends a compact_boundary record to the transcript; /clear
@@ -310,14 +331,6 @@ count_compactions() {
   echo "$count"
 }
 compactions=$(count_compactions)
-if (( ${compactions:-0} > 0 )); then
-  # Purples of Claude Code's dark theme, which draws its own token and
-  # compaction readouts in purple: the icon in skill/autoAccept, the count in
-  # the paler rainbow_indigo_shimmer so the two stay apart.
-  _sp=" "
-  (( COLS < 70 )) && _sp=""
-  ctx_out+=$(printf "%s\033[38;2;175;135;255mⴵ\033[38;2;195;180;230m%d\033[0m" "$_sp" "$compactions")
-fi
 
 # --- Fetch usage from API (with caching) ---
 # The usage figures come from the same OAuth endpoint the /usage command uses.
@@ -376,14 +389,6 @@ else
   # stays false and both quota metrics render as n/a.
 fi
 
-if $usage_ok; then
-  sess_out=$(format_metric "sess" "s" "$sess_pct")
-  week_out=$(format_metric "week" "w" "$week_pct")
-else
-  sess_out=$(format_metric_na "sess" "s")
-  week_out=$(format_metric_na "week" "w")
-fi
-
 # --- Reset countdown ---
 # Prints a dim "↻<countdown>" segment for an ISO reset timestamp, placed right
 # after its metric. Empty output if the timestamp is missing/past/unparseable.
@@ -412,19 +417,6 @@ fmt_reset() {
 
 sess_reset_out=$(fmt_reset "$sess_resets_at")
 week_reset_out=$(fmt_reset "$week_resets_at")
-
-# --- Assemble ---
-SEP="  "
-(( COLS < 70 )) && SEP=" "
-
-# The model stays visible at every width; below the full layout it collapses to
-# its initial + version, which costs 2-3 columns instead of 6-10.
-if (( COLS >= 90 )); then
-  model_str="$model"
-else
-  model_str=$(abbrev_model "$model")
-fi
-model_out=$(printf "\033[38;5;80m%s\033[0m" "$model_str")
 
 # --- Ultracode ---
 # Ultracode (xhigh plus workflow orchestration) is not in the status line JSON,
@@ -588,7 +580,7 @@ fi
 EFFORT_RAINBOW=("235;95;87" "245;139;87" "250;195;95" "145;200;130" "130;170;220" "155;130;200" "200;130;180")
 format_effort() {
   local level=$1 text=$1 rgb
-  if (( COLS < 90 )); then
+  if (( TIER >= 2 )); then
     case "$level" in
       low) text="lo" ;; medium) text="med" ;; high) text="hi" ;; xhigh) text="xhi" ;; ultracode) text="ultra" ;;
     esac
@@ -615,7 +607,67 @@ format_effort() {
   esac
   printf '\033[38;2;%sm%s\033[0m' "$rgb" "$text"
 }
-[[ -n "$effort" ]] && model_out+=" $(format_effort "$effort")"
+# --- Assemble ---
+# Layout tiers, widest first:
+#   0  full, plus (used/total) token counts on the context meter
+#   1  full labels, 10-cell bars
+#   2  initials for labels, 5-cell bars, abbreviated model and effort
+#   3  labels and percentages only, no bars
+render_line() {
+  local TIER=$1 SEP="  " model_out ctx_out sess_out week_out
+  (( TIER == 3 )) && SEP=" "
 
-printf "%s %s%s%s%s%s%s%s%s%s" \
-  "$TAG" "$model_out" "$SEP" "$ctx_out" "$SEP" "$sess_out" "$sess_reset_out" "$SEP" "$week_out" "$week_reset_out"
+  # The model stays visible at every width; below the full layout it collapses
+  # to its initial + version, which costs 2-3 columns instead of 6-10.
+  if (( TIER <= 1 )); then
+    model_out=$(format_model "$model" false)
+  else
+    model_out=$(format_model "$model" true)
+  fi
+  [[ -n "$effort" ]] && model_out+=" $(format_effort "$effort")"
+
+  ctx_out=$(format_metric "ctx" "c" "$ctx_pct_int")
+  if (( TIER == 0 )) && (( ctx_tok_total > 0 )); then
+    ctx_out+=$(printf " \033[38;5;248m(%s/%s)\033[0m" "$(fmt_tokens "$ctx_tok_used")" "$(fmt_tokens "$ctx_tok_total")")
+  fi
+  if (( ${compactions:-0} > 0 )); then
+    # Purples of Claude Code's dark theme, which draws its own token and
+    # compaction readouts in purple: the icon in skill/autoAccept, the count in
+    # the paler rainbow_indigo_shimmer so the two stay apart.
+    local _sp=" "
+    (( TIER == 3 )) && _sp=""
+    ctx_out+=$(printf "%s\033[38;2;175;135;255mⴵ\033[38;2;195;180;230m%d\033[0m" "$_sp" "$compactions")
+  fi
+
+  if $usage_ok; then
+    sess_out=$(format_metric "sess" "s" "$sess_pct")
+    week_out=$(format_metric "week" "w" "$week_pct")
+  else
+    sess_out=$(format_metric_na "sess" "s")
+    week_out=$(format_metric_na "week" "w")
+  fi
+
+  printf "%s %s%s%s%s%s%s%s%s%s" \
+    "$TAG" "$model_out" "$SEP" "$ctx_out" "$SEP" "$sess_out" "$sess_reset_out" "$SEP" "$week_out" "$week_reset_out"
+}
+
+# Terminal cells a rendered line occupies: SGR sequences take none, the
+# fullwidth brackets of the account tag take two each, everything else one.
+display_width() {
+  local LC_ALL=C.UTF-8 plain wide
+  plain=$(sed 's/\x1b\[[0-9;]*m//g' <<< "$1")
+  wide=${plain//[^【】]/}
+  echo $(( ${#plain} + ${#wide} ))
+}
+
+# Pick the widest layout that fits. The label and org name vary in length, so
+# a fixed column threshold per tier can overflow; measuring the actual line
+# cannot. Claude Code indents the status line and truncates it with "…" a few
+# columns short of the terminal edge, hence the margin.
+budget=$(( COLS - ${STATUSLINE_MARGIN:-4} ))
+for tier in 0 1 2 3; do
+  line=$(render_line "$tier")
+  (( tier == 3 )) && break
+  (( $(display_width "$line") <= budget )) && break
+done
+printf '%s' "$line"

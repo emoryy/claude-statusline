@@ -193,12 +193,12 @@ def make(glyphs, tmp):
             sys.exit(f"statusline.sh failed (exit {r.returncode}):\n{r.stdout}\n{r.stderr}")
         return r.stdout
 
-    layouts = [run(120, "high"), run(80, "high"), run(60, "high")]
+    layouts = [run(140, "high"), run(100, "high"), run(70, "high")]
     efforts = ["low", "medium", "high", "xhigh", "max", "ultracode"]
     lines = []
     for e in efforts:
         if e == "ultracode":
-            lines.append(run(120, "xhigh"))
+            lines.append(run(140, "xhigh"))
         else:
             # Without the ultracode record the latest state is "off".
             with open(transcript, "a") as t:
@@ -206,7 +206,7 @@ def make(glyphs, tmp):
                 t.write(json.dumps({"type": "attachment", "attachment": {"type": "ultra_effort_exit"},
                                     "timestamp": iso(datetime.now(timezone.utc) + timedelta(seconds=10))},
                                    separators=(",", ":")) + "\n")
-            lines.append(run(120, e))
+            lines.append(run(140, e))
             with open(transcript) as t:
                 kept = t.readlines()[:-1]
             transcript.write_text("".join(kept))

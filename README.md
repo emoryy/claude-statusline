@@ -2,13 +2,18 @@
 
 A status line for [Claude Code](https://claude.com/claude-code) showing the account
 in use, the model and its effort level, context fill, and both usage quotas with their reset countdowns.
-Layout collapses in three steps as the terminal narrows.
+Layout collapses in three steps as the terminal narrows, picking the fullest one that fits.
 
-![The status line at 120, 80 and 60 columns](docs/layouts.png)
+![The status line at 140, 100 and 70 columns](docs/layouts.png)
 
 Percentages are colored green below 50%, yellow from 50%, red from 80%. Bars use
 partial-block glyphs for eighth-of-a-cell resolution, so a 10-cell bar has 80
 distinct levels.
+The percentage sits inside its bar when it fits with at least one cell to spare
+from the fill edge: right-aligned in the empty part, or else left-aligned in
+the filled part, and after the bar only when neither has room.
+
+The model name and its version are drawn in two neighbouring teals.
 
 The effort level (`low`, `medium`, `high`, `xhigh`, `max`) takes the colors the `/effort` picker gives it in the dark theme: yellow, green, pale blue, purple, and a rainbow for `max`. The picker animates the top two; the status line cannot, so `xhigh` gets the plain purple and `max` a per-letter rainbow. Models without effort support (Haiku) show no effort segment. Ultracode (xhigh plus workflow orchestration, team and enterprise plans) is shown as a filled purple `ultracode` badge, `ultra` below 90 columns; see the notes below for how it is detected.
 
@@ -89,6 +94,7 @@ All optional; the defaults need no setup.
 | `STATUSLINE_CACHE_FILE` | Where to keep the usage cache. |
 | `STATUSLINE_CACHE_TTL` | Cache lifetime in seconds. Default 300. |
 | `STATUSLINE_COLS` | Forces a terminal width. Useful for testing the collapsed layouts. |
+| `STATUSLINE_MARGIN` | Columns kept free on top of the line itself when choosing a layout. Default 4. |
 | `STATUSLINE_STATE_DIR` | Where the per-process ultracode state files and the per-transcript compaction counts go. Default: `$XDG_RUNTIME_DIR/claude-statusline`, or `/tmp/claude-statusline`. |
 
 Colors accept an xterm-256 index (`152`), a hex triplet (`#98c0c0`), or a raw SGR
@@ -113,12 +119,18 @@ which account is spending. Pin the colors if you want them stable:
 
 ## Layout tiers
 
-| Width | Layout |
+| Tier | Layout |
 |---|---|
-| ≥ 100 | full, plus `(used/total)` token counts on the context meter |
-| ≥ 90 | full labels, 10-cell bars |
-| 70-89 | initials for labels, 5-cell bars, model abbreviated to `O5` / `H4.5`, effort to `lo` / `med` / `hi` / `xhi` / `max` |
-| < 70 | labels and percentages only, no bars |
+| 0 | full, plus `(used/total)` token counts on the context meter |
+| 1 | full labels, 10-cell bars |
+| 2 | initials for labels, 5-cell bars, model abbreviated to `O5` / `H4.5`, effort to `lo` / `med` / `hi` / `xhi` / `max` |
+| 3 | labels and percentages only, no bars |
+
+The script renders the tiers in this order and prints the first one whose
+visible width fits the terminal, less a margin of 4 columns: Claude Code indents
+the status line by two and truncates it with `…` two short of the edge. The
+cutoffs therefore depend on how long the account label and org name are, not on
+fixed column counts.
 
 A `[1m]` long-context marker in the model name becomes a trailing `+` (`S5+`).
 
